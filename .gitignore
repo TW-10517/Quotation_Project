@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+build/
+dist/
+release/
+*.spec
+
+# Never commit real quotations or their extracted output
+*.pdf
+*.docx
+*.xlsx
+*.xlsm
+*.csv
+*.tsv
+*.inspect.txt
