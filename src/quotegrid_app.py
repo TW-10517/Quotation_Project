@@ -28,9 +28,62 @@ APP_NAME = "QuoteGrid"
 _ASSETS = (Path(sys._MEIPASS) / "assets" if hasattr(sys, "_MEIPASS")
            else Path(__file__).resolve().parent.parent / "assets")
 COLUMNS = _qe.COLUMNS
-extract = _qe.extract
 inspect_file = _qe.inspect
 SUPPORTED_EXTS = tuple(_qe.READERS.keys())
+MAX_FILES_PER_DROP = 100
+
+
+# ---------------------------------------------------------------------------
+# Privacy: QuoteGrid never talks to the network. Enforce that in-process so a
+# future library change can't quietly send quotation data anywhere.
+# ---------------------------------------------------------------------------
+def _block_network() -> None:
+    import socket
+    loopback = {"127.0.0.1", "::1", "localhost"}
+    orig_connect, orig_connect_ex = socket.socket.connect, socket.socket.connect_ex
+
+    def _check(addr) -> None:
+        host = addr[0] if isinstance(addr, tuple) else addr
+        if host not in loopback:
+            raise PermissionError("QuoteGrid works offline; network access is disabled")
+
+    def connect(self, addr):
+        _check(addr); return orig_connect(self, addr)
+
+    def connect_ex(self, addr):
+        _check(addr); return orig_connect_ex(self, addr)
+
+    socket.socket.connect, socket.socket.connect_ex = connect, connect_ex
+
+
+class _PrivateTemp:
+    """Dropped files are written to a private temp folder under random names
+    (never the original file name) and deleted as soon as they are read."""
+    def __init__(self) -> None:
+        self._dir = tempfile.TemporaryDirectory(prefix="quotegrid_")
+
+    def write(self, name: str, data: bytes) -> Path:
+        suffix = Path(name).suffix.lower()
+        if suffix not in SUPPORTED_EXTS:
+            raise ValueError(f"unsupported type ({suffix or 'none'})")
+        p = Path(self._dir.name) / f"{uuid.uuid4().hex}{suffix}"
+        p.write_bytes(data)
+        return p
+
+    def __enter__(self): return self
+    def __exit__(self, *exc): self._dir.cleanup()
+
+
+def _purge_old_temp() -> None:
+    """Remove temp copies a crashed earlier session may have left behind."""
+    import shutil
+    tmp = Path(tempfile.gettempdir())
+    for pattern in ("quotegrid_*", "qx_*"):
+        for p in tmp.glob(pattern):
+            try:
+                shutil.rmtree(p) if p.is_dir() else p.unlink()
+            except OSError:
+                pass
 
 
 def _win_set_clipboard(text: str) -> None:
@@ -80,11 +133,11 @@ def _win_set_clipboard(text: str) -> None:
 # Python API exposed to JS as window.pywebview.api.*
 # ---------------------------------------------------------------------------
 class Api:
+    # Only methods without a leading underscore are callable from the page.
+    # None of them accept a file path from the page: files arrive either
+    # through the native Open dialog or as dropped bytes.
     def __init__(self) -> None:
         self._window: webview.Window | None = None
-
-    def set_window(self, window: webview.Window) -> None:
-        self._window = window
 
     def supported_exts(self) -> list[str]:
         return list(SUPPORTED_EXTS)
@@ -103,83 +156,70 @@ class Api:
             return {"ok": False, "cancelled": True}
         return self._extract_paths(list(result))
 
-    def extract_paths(self, paths: list[str]) -> dict:
-        return self._extract_paths(paths)
-
     # ---- extract from dropped bytes --------------------------------------
     def extract_dropped(self, files: list[dict]) -> dict:
-        """files: list of {name, data_b64}. Writes each to a temp file then
-        runs the regular extractor."""
-        tmp_paths: list[str] = []
-        try:
+        """files: list of {name, data_b64}."""
+        if len(files) > MAX_FILES_PER_DROP:
+            return {"ok": False, "error": f"drop at most {MAX_FILES_PER_DROP} files at a time"}
+        out_rows, errors = [], []
+        with _PrivateTemp() as tmp:
             for f in files:
-                data = base64.b64decode(f["data_b64"])
-                stem = Path(f["name"]).stem
-                suf  = Path(f["name"]).suffix or ".bin"
-                tmp = Path(tempfile.gettempdir()) / f"qx_{os.getpid()}_{uuid.uuid4().hex[:8]}_{stem}{suf}"
-                tmp.write_bytes(data)
-                tmp_paths.append(str(tmp))
-            # Map temp paths back to original filenames for display
-            result = self._extract_paths(tmp_paths, display_names=[f["name"] for f in files])
-            return result
-        finally:
-            for p in tmp_paths:
+                display = Path(str(f.get("name", "file"))).name   # name only, never a path
                 try:
-                    Path(p).unlink()
-                except OSError:
-                    pass
-
-    def _extract_paths(self, paths: list[str], display_names: list[str] | None = None) -> dict:
-        out_rows: list[dict] = []
-        errors: list[dict] = []
-        for i, p in enumerate(paths):
-            path = Path(p)
-            display = (display_names[i] if display_names else path.name)
-            if not path.is_file():
-                errors.append({"file": display, "error": "not a file"})
-                continue
-            if path.suffix.lower() not in SUPPORTED_EXTS:
-                errors.append({"file": display, "error": f"unsupported type ({path.suffix})"})
-                continue
-            try:
-                rows = extract(path)
-            except Exception as e:
-                errors.append({"file": display, "error": f"{type(e).__name__}: {e}"})
-                continue
-            for idx, row in enumerate(rows):
-                out_rows.append({
-                    "id": uuid.uuid4().hex,
-                    "file": display,
-                    "variant": (idx + 1) if len(rows) > 1 else None,
-                    "variant_count": len(rows),
-                    "row": {c: row.get(c, "") for c in COLUMNS},
-                })
+                    data = base64.b64decode(f["data_b64"], validate=True)
+                    if len(data) > _qe.MAX_FILE_BYTES:
+                        raise ValueError(f"file is larger than {_qe.MAX_FILE_BYTES // (1024 * 1024)} MB")
+                    self._extract_one(tmp.write(display, data), display, out_rows, errors)
+                except Exception as e:
+                    errors.append({"file": display, "error": str(e)})
         return {"ok": True, "rows": out_rows, "errors": errors, "columns": COLUMNS}
+
+    def _extract_paths(self, paths: list[str]) -> dict:
+        out_rows, errors = [], []
+        for p in paths:
+            path = Path(p)
+            if not path.is_file():
+                errors.append({"file": path.name, "error": "not a file"})
+            elif path.suffix.lower() not in SUPPORTED_EXTS:
+                errors.append({"file": path.name, "error": f"unsupported type ({path.suffix})"})
+            else:
+                self._extract_one(path, path.name, out_rows, errors)
+        return {"ok": True, "rows": out_rows, "errors": errors, "columns": COLUMNS}
+
+    @staticmethod
+    def _extract_one(path: Path, display: str, out_rows: list, errors: list) -> None:
+        try:
+            results = _qe.extract_checked(path)
+        except Exception as e:
+            errors.append({"file": display, "error": str(e) or type(e).__name__})
+            return
+        for idx, res in enumerate(results):
+            out_rows.append({
+                "id": uuid.uuid4().hex,
+                "file": display,
+                "variant": (idx + 1) if len(results) > 1 else None,
+                "variant_count": len(results),
+                "row": res["row"],
+                "warn": res["warn"],
+            })
 
     # ---- inspect: show the user exactly what the extractor saw ------------
     def inspect_dropped(self, name: str, data_b64: str) -> dict:
+        display = Path(str(name)).name
         try:
-            data = base64.b64decode(data_b64)
+            data = base64.b64decode(data_b64, validate=True)
         except Exception as e:
-            return {"ok": False, "error": f"bad base64: {e}"}
-        stem = Path(name).stem
-        suf  = Path(name).suffix or ".bin"
-        tmp = Path(tempfile.gettempdir()) / f"qx_dbg_{os.getpid()}_{uuid.uuid4().hex[:8]}_{stem}{suf}"
-        tmp.write_bytes(data)
+            return {"ok": False, "error": f"could not read the file: {e}"}
+        if len(data) > _qe.MAX_FILE_BYTES:
+            return {"ok": False, "error": "file is too large"}
         try:
-            r = inspect_file(tmp)
-            if r.get("ok"):
-                r["file"] = name
-            return r
-        finally:
-            try: tmp.unlink()
-            except OSError: pass
-
-    def inspect_path(self, path: str) -> dict:
-        p = Path(path)
-        if not p.is_file():
-            return {"ok": False, "error": "not a file"}
-        return inspect_file(p)
+            with _PrivateTemp() as tmp:
+                r = inspect_file(tmp.write(display, data))
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        if r.get("ok"):
+            r["file"] = display
+        return r
 
     def save_inspect(self, data: dict) -> dict:
         """Write the inspect dump to a text file the user can share back."""
@@ -238,7 +278,7 @@ class Api:
         lines = ["\t".join(COLUMNS)]
         for r in rows:
             data = r.get("row", {})
-            lines.append("\t".join((data.get(c) or "").replace("\t", " ").replace("\n", " ") for c in COLUMNS))
+            lines.append("\t".join(_qe._safe_cell(str(data.get(c) or "")) for c in COLUMNS))
         out.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
         return {"ok": True, "path": str(out), "count": len(rows)}
 
@@ -251,6 +291,9 @@ HTML = r"""
 <html lang="en">
 <head>
 <meta charset="utf-8" />
+<!-- The page may not load or send anything over the network -->
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; connect-src 'none'; form-action 'none'; frame-src 'none'; base-uri 'none'" />
 <title>QuoteGrid</title>
 <style>
   :root {
@@ -404,6 +447,7 @@ HTML = r"""
   table.data td input[type=text]:hover { border-color: var(--border-2); background: var(--panel-2); }
   table.data td input[type=text]:focus { border-color: var(--accent); background: #1f2434; }
   table.data td.empty input[type=text] { color: var(--muted-2); }
+  table.data td.warn input[type=text] { border-color: rgba(251,191,36,.55); background: rgba(251,191,36,.08); color: var(--warn); }
 
   .fileTag { display:inline-flex; align-items:center; gap:6px; font-size:12px; }
   .fileTag .dot { width:8px; height:8px; border-radius:50%; background:var(--accent-2); flex:none; }
@@ -472,7 +516,7 @@ HTML = r"""
         <img class="logo" src="__LOGO__" alt="" />
         <div>
           <h1>QuoteGrid</h1>
-          <div class="sub">Drop one or many quotations · PDF · DOCX · TXT · CSV · XLSX</div>
+          <div class="sub">Drop one or many quotations · PDF · DOCX · TXT · CSV · XLSX · images (PNG / JPG)</div>
         </div>
       </div>
       <div class="pill" id="statusPill">idle</div>
@@ -753,9 +797,13 @@ HTML = r"""
       inp.type = "text";
       inp.value = v;
       inp.placeholder = "—";
+      const why = r.warn && r.warn[col];
+      if (why && v) { td.classList.add("warn"); inp.title = "Check this value: " + why; }
       inp.addEventListener("input", (e) => {
         r.row[col] = e.target.value;
         td.classList.toggle("empty", !e.target.value);
+        td.classList.remove("warn"); inp.title = "";   // the user has reviewed it
+        if (r.warn) delete r.warn[col];
         refreshStats();
       });
       td.appendChild(inp);
@@ -1047,6 +1095,8 @@ def build_html() -> str:
 
 
 def main() -> int:
+    _block_network()
+    _purge_old_temp()
     api = Api()
     window = webview.create_window(
         title=APP_NAME,
@@ -1057,8 +1107,11 @@ def main() -> int:
         min_size=(1100, 680),
         background_color="#0b0d12",
     )
-    api.set_window(window)
-    webview.start(gui="edgechromium" if sys.platform == "win32" else None)
+    api._window = window
+    # private_mode: no cookies/cache/local storage kept on disk; no dev tools
+    webview.start(gui="edgechromium" if sys.platform == "win32" else None,
+                  private_mode=True, debug=False)
+    _purge_old_temp()
     return 0
 
 

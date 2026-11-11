@@ -13,3 +13,10 @@ release/
 *.csv
 *.tsv
 *.inspect.txt
+# real supplier prices used by local tests
+tests/real_samples.py
+# images may be scanned quotations
+*.png
+*.jpg
+*.jpeg
+!assets/*.png

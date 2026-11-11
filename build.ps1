@@ -16,6 +16,8 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed --noupx `
   --paths "$root\src" `
   --add-data "$root\assets\logo_128.png;assets" `
   --collect-all pdfplumber --collect-all pypdfium2 --collect-data docx `
+  --hidden-import defusedxml --hidden-import defusedxml.ElementTree `
+  --collect-all winrt --hidden-import ocr `
   --workpath build --specpath build --distpath dist `
   src\quotegrid_app.py
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed" }
