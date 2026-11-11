@@ -3,23 +3,22 @@ Regression tests for the extractor.
 
     python tests/test_extract.py          (or: python -m pytest tests)
 
-Synthetic quotations are generated in a temp folder, so no real supplier
-data is stored in the repo. Tests against real quotations run only when
-the files exist in QUOTEGRID_SAMPLES (default: ~/Downloads).
+Only synthetic, made-up quotations are used. They are generated in a temp
+folder and deleted afterwards; no real supplier data is stored anywhere.
 """
 from __future__ import annotations
 
-import os
+import atexit
+import shutil
 import sys
 import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 import quote_extract as q  # noqa: E402
 
 TMP = Path(tempfile.mkdtemp(prefix="quotegrid_test_"))
-SAMPLES = Path(os.environ.get("QUOTEGRID_SAMPLES", Path.home() / "Downloads"))
+atexit.register(shutil.rmtree, TMP, ignore_errors=True)
 
 
 def _write(name: str, content: str) -> Path:
@@ -155,32 +154,6 @@ def test_oversized_file_refused():
     except ValueError:
         return
     raise AssertionError("oversized file was read")
-
-
-# ---------------------------------------------------------------- real files
-# Expected values for real quotations contain supplier prices, so they live
-# in tests/real_samples.py, which is git-ignored and exists only locally.
-try:
-    from real_samples import REAL  # noqa: E402
-except ImportError:
-    REAL = {}
-
-
-def test_real_quotations():
-    ran = 0
-    for name, expected in REAL.items():
-        p = SAMPLES / name
-        if not p.is_file():
-            continue
-        rows = _rows(p)
-        assert len(rows) == len(expected), f"{name}: {len(rows)} rows, expected {len(expected)}"
-        for row, want in zip(rows, expected):
-            try:
-                _expect(row, **want)
-            except AssertionError as e:
-                raise AssertionError(f"{name}: {e}") from None
-        ran += 1
-    print(f"  ({ran} real quotation(s) checked)")
 
 
 if __name__ == "__main__":
